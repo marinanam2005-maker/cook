@@ -1,180 +1,206 @@
-import base64, io, math, os, re, shutil, subprocess, tempfile
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.concurrency import run_in_threadpool
+import base64
+import io
+import os
+import shutil
+import subprocess
+import tempfile
+import threading
+
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 from starlette.background import BackgroundTask
 
-FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
-FONT_BOLD = os.environ.get("FONT_BOLD", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
-FONT_REG = os.environ.get("FONT_REGULAR", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-API_KEY = os.environ.get("API_KEY", "")
-app = FastAPI(title="recipe-ffmpeg")
+# ---------- Настройки (можно менять через переменные окружения Railway) ----------
+W = int(os.getenv("VIDEO_W", "1280"))
+H = int(os.getenv("VIDEO_H", "720"))
+FPS = int(os.getenv("VIDEO_FPS", "25"))
+CRF = os.getenv("VIDEO_CRF", "23")                 # качество: меньше = лучше, больше файл
+DEFAULT_DURATION = float(os.getenv("DEFAULT_DURATION", "3"))
+MAX_DURATION = float(os.getenv("MAX_DURATION", "30"))
+MAX_ITEMS = int(os.getenv("MAX_ITEMS", "30"))
+CARD_SIZE = int(os.getenv("CARD_SIZE", "480"))
+SHOW_TEXT = os.getenv("SHOW_TEXT", "1") == "1"     # подписи name/amount на кадре
+FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "240"))
+MARGIN = 60
 
-def font(size, bold=True):
-    return ImageFont.truetype(FONT_BOLD if bold else FONT_REG, max(8, int(size)))
+FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
-def decode_img(b64):
-    return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
+render_lock = threading.Semaphore(1)  # один рендер за раз — экономия памяти
+app = FastAPI()
 
-def wrap(draw, text, fnt, max_w):
-    words = str(text or "").split(); lines, cur = [], ""
+
+# ---------- Вспомогательные функции ----------
+def decode_image(b64, target=None):
+    if not b64 or not isinstance(b64, str):
+        raise ValueError("empty image b64")
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[1]
+    img = Image.open(io.BytesIO(base64.b64decode(b64)))
+    if target and img.format == "JPEG":
+        img.draft("RGB", target)  # быстрое уменьшение JPEG при чтении
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        white = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(white, img)
+    return img.convert("RGB")
+
+
+def wrap(draw, text, font, max_w):
+    words = str(text).split()
+    lines, cur = [], ""
     for w in words:
-        t = (cur + " " + w).strip()
-        if not cur or draw.textlength(t, font=fnt) <= max_w: cur = t
-        else: lines.append(cur); cur = w
-    if cur: lines.append(cur)
+        test = (cur + " " + w).strip()
+        if draw.textlength(test, font=font) <= max_w:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
     return lines
 
-def fit_text(text, max_w, max_h, start, min_size, bold):
-    d = ImageDraw.Draw(Image.new("RGBA", (4, 4))); size = int(start)
-    while size >= min_size:
-        f = font(size, bold); lines = wrap(d, text, f, max_w); lh = int(size * 1.18)
-        if len(lines) * lh <= max_h and all(d.textlength(l, font=f) <= max_w for l in lines):
-            return f, lines, lh
-        size -= 2
-    f = font(min_size, bold); lines = wrap(d, text, f, max_w); lh = int(min_size * 1.18)
-    maxn = max(1, int(max_h // lh))
-    if len(lines) > maxn:
-        lines = lines[:maxn]; lines[-1] = lines[-1].rstrip(" .,;:") + "…"
-    return f, lines, lh
 
-def draw_text(img, text, box, start, color, bold=True, min_size=14, valign="center"):
-    if not text: return
-    x, y, w, h = box
-    f, lines, lh = fit_text(text, w, h, start, min_size, bold)
-    d = ImageDraw.Draw(img); total = len(lines) * lh
-    cy = y + (h - total) / 2 if valign == "center" else y
-    stroke = max(1, f.size // 16)
-    for line in lines:
-        tw = d.textlength(line, font=f)
-        d.text((x + (w - tw) / 2, cy), line, font=f, fill=color, stroke_width=stroke, stroke_fill=(0, 0, 0, 190))
-        cy += lh
+def fit_lines(draw, text, font_path, max_w, start, min_size, max_lines):
+    if not text:
+        return None, []
+    for size in range(start, min_size - 1, -2):
+        font = ImageFont.truetype(font_path, size)
+        lines = wrap(draw, text, font, max_w)
+        if len(lines) <= max_lines:
+            return font, lines
+    font = ImageFont.truetype(font_path, min_size)
+    return font, wrap(draw, text, font, max_w)[:max_lines]
 
-def fit_image(im, w, h, cover=False, radius=0):
-    w, h = max(1, int(w)), max(1, int(h))
-    im = ImageOps.fit(im, (w, h), Image.LANCZOS) if cover else ImageOps.contain(im, (w, h), Image.LANCZOS)
-    if radius:
-        mask = Image.new("L", im.size, 0)
-        ImageDraw.Draw(mask).rounded_rectangle([0, 0, im.size[0] - 1, im.size[1] - 1], int(radius), fill=255)
-        im.putalpha(ImageChops.multiply(mask, im.getchannel("A")))
-    return im
 
-def split_grid(im, cols, rows):
-    W, H = im.size
-    return [im.crop((c * W // cols, r * H // rows, (c + 1) * W // cols, (r + 1) * H // rows))
-            for r in range(rows) for c in range(cols)]
+def as_text(v):
+    return "" if v is None else str(v).strip()
 
-def probe(path):
-    p = subprocess.run([FFMPEG, "-hide_banner", "-i", path], capture_output=True, text=True)
-    m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", p.stderr)
-    dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else None
-    return dur, ("Audio:" in p.stderr)
 
-def build(job, tmp):
-    W = int(job.get("width", 1600)); H = int(job.get("height", 900)); fps = int(job.get("fps", 30))
-    s = W / 1600.0; white = (255, 255, 255, 255)
-    bg = job.get("background") or {}
-    if not bg.get("b64"): raise ValueError("background.b64 is required")
-    ext = (bg.get("ext") or "png").lower().strip(".")
-    bg_path = os.path.join(tmp, "bg." + ext)
-    with open(bg_path, "wb") as fh: fh.write(base64.b64decode(bg["b64"]))
-    is_video = ext in ("mp4", "mov", "webm", "mkv")
-    bg_dur, bg_audio = probe(bg_path) if is_video else (None, False)
-    dur = float(job.get("duration") or bg_dur or 20)
-    overlays = []; mode = job.get("mode", "cards")
+def make_frame(bg, card, name, amount, path):
+    frame = bg.copy().convert("RGBA")
+    has_text = SHOW_TEXT and (name or amount)
 
-    header_h = int((230 if mode == "title" else 170) * s)
-    head = Image.new("RGBA", (W, header_h), (0, 0, 0, 0))
-    draw_text(head, job.get("title", ""), (int(60*s), int(25*s), W - int(120*s), header_h - int(40*s)),
-              (86 if mode == "title" else 72) * s, white, True, int(28*s))
-    hp = os.path.join(tmp, "head.png"); head.save(hp); overlays.append((hp, 0, 0, 0.2))
+    text_x = MARGIN
+    if card is not None:
+        c = ImageOps.contain(card, (CARD_SIZE, CARD_SIZE), Image.LANCZOS)
+        cx = MARGIN if has_text else (W - c.width) // 2
+        cy = (H - c.height) // 2
+        frame.paste(c, (cx, cy))
+        text_x = cx + c.width + MARGIN
 
-    dish_path = None
-    if mode == "title":
-        dish = job.get("dish") or {}
-        if not dish.get("b64"): raise ValueError("dish.b64 is required for title mode")
-        zf = float(job.get("zoom_from", 1.25))
-        box_w, box_h = W - int(200*s), H - header_h - int(40*s)
-        im = fit_image(decode_img(dish["b64"]), box_w*zf, box_h*zf, radius=int(28*s*zf))
-        dish_path = os.path.join(tmp, "dish.png"); im.save(dish_path)
-        dish_cy = header_h + box_h / 2 + int(10*s)
-    else:
-        items = job.get("items") or []
-        if not items: raise ValueError("items are required for cards mode")
-        frames = []; col = job.get("collage")
-        if col and col.get("b64"):
-            n = len(items); cols = int(col.get("cols") or math.ceil(math.sqrt(n)))
-            rows = int(col.get("rows") or math.ceil(n / cols))
-            frames = split_grid(decode_img(col["b64"]), cols, rows)
-        layout = job.get("layout", "ingredients"); per_row = int(job.get("per_row", 5))
-        n = len(items); rows = math.ceil(n / per_row)
-        margin, gap = int(40*s), int(18*s); top = header_h; area_h = H - top - int(30*s)
-        cols_max = min(per_row, n)
-        cell_w = (W - 2*margin - (cols_max-1)*gap) / cols_max
-        cell_h = (area_h - (rows-1)*gap) / rows
-        img_ratio = 0.66 if layout == "ingredients" else 0.50
-        step = min(1.0, max(0.25, (dur * 0.45) / n))
-        for i, it in enumerate(items):
-            r, c = divmod(i, per_row); in_row = min(per_row, n - r*per_row)
-            row_w = in_row*cell_w + (in_row-1)*gap
-            x0 = (W - row_w)/2 + c*(cell_w+gap); y0 = top + r*(cell_h+gap)
-            cw, ch = int(cell_w), int(cell_h)
-            card = Image.new("RGBA", (cw, ch), (0, 0, 0, 0)); ih = int(ch * img_ratio)
-            src = None
-            if it.get("image_b64"): src = decode_img(it["image_b64"])
-            elif it.get("collage_index") is not None and int(it["collage_index"]) < len(frames):
-                src = frames[int(it["collage_index"])]
-            if src is not None:
-                pic = fit_image(src, cw - int(8*s), ih - int(8*s), cover=(layout != "ingredients"), radius=int(18*s))
-                card.alpha_composite(pic, ((cw - pic.size[0])//2, (ih - pic.size[1])//2))
-            rest = ch - ih
-            if layout == "ingredients":
-                draw_text(card, it.get("name", ""), (0, ih, cw, int(rest*0.55)), 34*s, white, True, int(14*s))
-                draw_text(card, it.get("sub", ""), (0, ih + int(rest*0.55), cw, int(rest*0.45)), 28*s, white, False, int(12*s))
-            else:
-                draw_text(card, it.get("name", ""), (0, ih + int(4*s), cw, int(rest*0.28)), 30*s, white, True, int(14*s))
-                draw_text(card, it.get("sub", ""), (int(4*s), ih + int(rest*0.30), cw - int(8*s), int(rest*0.68)),
-                          24*s, white, False, int(12*s), valign="top")
-            p = os.path.join(tmp, f"item{i}.png"); card.save(p)
-            overlays.append((p, int(x0), int(y0), round(0.6 + i*step, 3)))
+    if has_text:
+        box_w = W - text_x - MARGIN
+        if box_w > 150:
+            pad = 30
+            d = ImageDraw.Draw(frame)
+            nf, nl = fit_lines(d, name, FONT_BOLD, box_w - 2 * pad, 64, 30, 3)
+            af, al = fit_lines(d, amount, FONT_REG, box_w - 2 * pad, 46, 24, 2)
+            nlh = int(nf.size * 1.25) if nf else 0
+            alh = int(af.size * 1.25) if af else 0
+            gap = 20 if (nl and al) else 0
+            box_h = nlh * len(nl) + gap + alh * len(al) + 2 * pad
+            by = (H - box_h) // 2
 
-    out = os.path.join(tmp, "out.mp4")
-    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
-    cmd += ["-stream_loop", "-1", "-i", bg_path] if is_video else ["-loop", "1", "-framerate", str(fps), "-i", bg_path]
-    for p, *_ in overlays: cmd += ["-loop", "1", "-framerate", str(fps), "-t", f"{dur:.3f}", "-i", p]
-    if dish_path: cmd += ["-loop", "1", "-framerate", str(fps), "-i", dish_path]
-    f = [f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={fps},format=yuv420p[b0]"]
-    last = "b0"
-    if dish_path:
-        di = len(overlays) + 1; zf = float(job.get("zoom_from", 1.25))
-        f.append(f"[{di}:v]format=rgba,scale=w='trunc(iw*(1-(1-1/{zf})*min(t/{dur},1))/2)*2':h=-2:eval=frame,"
-                 f"fade=t=in:st=0:d=0.6:alpha=1[dish]")
-        f.append(f"[{last}][dish]overlay=x='(W-w)/2':y='{dish_cy}-h/2':eval=frame[bd]"); last = "bd"
-    for idx, (p, x, y, st) in enumerate(overlays, start=1):
-        f.append(f"[{idx}:v]format=yuva420p,fade=t=in:st={st}:d=0.5:alpha=1[o{idx}]")
-        f.append(f"[{last}][o{idx}]overlay={x}:{y}:format=yuv420:shortest=0[v{idx}]"); last = f"v{idx}"
-    f.append(f"[{last}]format=yuv420p[vout]")
-    cmd += ["-filter_complex_threads", "1", "-filter_complex", ";".join(f), "-map", "[vout]"]
-    if bg_audio: cmd += ["-map", "0:a", "-c:a", "aac", "-b:a", "160k"]
-    cmd += ["-t", f"{dur:.3f}", "-r", str(fps), "-c:v", "libx264", "-preset", job.get("preset", "veryfast"),
-            "-crf", str(job.get("crf", 20)), "-threads", os.environ.get("FFMPEG_THREADS", "0"),
-            "-movflags", "+faststart", out]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0: raise RuntimeError(f"ffmpeg failed (code {p.returncode}): " + p.stderr[-2000:])
-    return out
+            overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+            ImageDraw.Draw(overlay).rounded_rectangle(
+                [text_x, by, text_x + box_w, by + box_h], radius=24, fill=(0, 0, 0, 150)
+            )
+            frame = Image.alpha_composite(frame, overlay)
+            d = ImageDraw.Draw(frame)
 
+            y = by + pad
+            for line in nl:
+                d.text((text_x + pad, y), line, font=nf, fill=(255, 255, 255))
+                y += nlh
+            y += gap
+            for line in al:
+                d.text((text_x + pad, y), line, font=af, fill=(255, 214, 120))
+                y += alh
+
+    frame.convert("RGB").save(path, "JPEG", quality=90)
+
+
+def parse_duration(v):
+    try:
+        d = float(v)
+    except (TypeError, ValueError):
+        return DEFAULT_DURATION
+    if d <= 0:
+        return DEFAULT_DURATION
+    return min(d, MAX_DURATION)
+
+
+# ---------- Эндпоинты ----------
 @app.get("/health")
-def health(): return {"ok": True}
+def health():
+    return {"ok": True, "ffmpeg": shutil.which("ffmpeg") is not None, "size": f"{W}x{H}", "fps": FPS}
+
 
 @app.post("/render")
-async def render(req: Request):
-    if API_KEY and req.headers.get("x-api-key") != API_KEY: raise HTTPException(401, "bad api key")
-    try: job = await req.json()
-    except Exception: raise HTTPException(400, "body must be JSON")
-    tmp = tempfile.mkdtemp()
-    try: out = await run_in_threadpool(build, job, tmp)
+def render(payload: dict = Body(...)):
+    bg_b64 = (payload.get("background") or {}).get("b64")
+    if not bg_b64:
+        raise HTTPException(400, "background.b64 is required")
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise HTTPException(400, "items[] is required")
+    if len(items) > MAX_ITEMS:
+        raise HTTPException(400, f"too many items (max {MAX_ITEMS})")
+
+    workdir = tempfile.mkdtemp(prefix="render_")
+    out = os.path.join(workdir, "out.mp4")
+    try:
+        with render_lock:
+            bg = ImageOps.fit(decode_image(bg_b64, (W, H)), (W, H), Image.LANCZOS)
+
+            entries = []
+            for i, it in enumerate(items):
+                it = it or {}
+                card = decode_image(it["b64"], (CARD_SIZE, CARD_SIZE)) if it.get("b64") else None
+                p = os.path.join(workdir, f"f{i:03d}.jpg")
+                make_frame(bg, card, as_text(it.get("name")), as_text(it.get("amount")), p)
+                del card
+                entries.append((p, parse_duration(it.get("duration"))))
+            del bg
+
+            list_path = os.path.join(workdir, "list.txt")
+            with open(list_path, "w", encoding="utf-8") as f:
+                for p, d in entries:
+                    f.write(f"file '{p}'\nduration {d}\n")
+                f.write(f"file '{entries[-1][0]}'\n")  # особенность concat: повтор последнего кадра
+
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "concat", "-safe", "0", "-i", list_path,
+                "-vf", f"fps={FPS},format=yuv420p",
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+                "-crf", CRF, "-threads", "1",
+                "-movflags", "+faststart",
+                out,
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+            if r.returncode != 0 or not os.path.exists(out):
+                raise HTTPException(500, f"ffmpeg failed (code {r.returncode}): {r.stderr[-1500:]}")
+    except HTTPException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+    except (ValueError, UnidentifiedImageError) as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(400, f"bad image: {e}")
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(504, "ffmpeg timeout")
     except Exception as e:
-        shutil.rmtree(tmp, ignore_errors=True); raise HTTPException(400, str(e))
-    return FileResponse(out, media_type="video/mp4", filename=job.get("output_name", "video.mp4"),
-                        background=BackgroundTask(shutil.rmtree, tmp, True))
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(500, f"render error: {e}")
+
+    return FileResponse(
+        out,
+        media_type="video/mp4",
+        filename="video.mp4",
+        background=BackgroundTask(shutil.rmtree, workdir, True),
+    )
