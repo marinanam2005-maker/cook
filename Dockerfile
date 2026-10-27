@@ -1,8 +1,11 @@
-FROM python:3.11-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core \
-    && rm -rf /var/lib/apt/lists/*
+FROM node:20-bookworm-slim
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg bash ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py .
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+COPY package.json ./
+RUN npm install --omit=dev
+COPY server.js ./
+ENV NODE_ENV=production
+EXPOSE 8080
+CMD ["node", "server.js"]
