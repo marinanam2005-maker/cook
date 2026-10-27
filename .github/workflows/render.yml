@@ -1,0 +1,50 @@
+name: render
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: "JSON payload from n8n (files, script, script_name, out, job_id, callback_url, meta)"
+        required: true
+permissions:
+  contents: write
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg jq
+      - name: Render
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: node render.mjs
+      - name: Publish release and notify n8n
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          JOB=$(echo "$PAYLOAD" | jq -r '.job_id // empty' | tr -c 'A-Za-z0-9._-' '-')
+          [ -z "$JOB" ] && JOB="run"
+          TAG="render-${JOB}-${{ github.run_id }}"
+          OUT=$(echo "$PAYLOAD" | jq -r '.out // "final.mp4"' | xargs basename)
+          gh release create "$TAG" "work/out/$OUT" --title "$TAG" --notes "n8n render"
+          ASSET_URL=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq '.assets[0].url')
+          CB=$(echo "$PAYLOAD" | jq -r '.callback_url // empty')
+          if [ -n "$CB" ]; then
+            echo "$PAYLOAD" | jq --arg url "$ASSET_URL" --arg out "$OUT" --arg tag "$TAG" \
+              '{status:"done", download_url:$url, out:$out, release_tag:$tag, job_id:.job_id, meta:.meta}' \
+              | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$CB"
+          fi
+      - name: Notify n8n on failure
+        if: failure()
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          CB=$(echo "$PAYLOAD" | jq -r '.callback_url // empty')
+          [ -n "$CB" ] && echo "$PAYLOAD" | jq --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{status:"error", error:"GitHub Action failed", run_url:$run, job_id:.job_id, meta:.meta}' \
+            | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$CB" || true
